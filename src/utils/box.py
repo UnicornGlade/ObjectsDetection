@@ -1,4 +1,5 @@
 import cv2, numpy as np, torch
+from torchvision.ops import nms as torch_nms
 
 COLORS = [(255, 0, 0), (0, 255, 0), (0, 128, 255)]
 
@@ -26,7 +27,7 @@ def alb2yolo(box, lbl):
     return f'{lbl} ' + ' '.join(f'{v:.6f}' for v in box)
 
 def nms(boxes, scores, iou_thr=0.55):
-    keep = torch.ops.torchvision.nms(torch.tensor(boxes), torch.tensor(scores), iou_thr)
+    keep = torch_nms(torch.tensor(boxes), torch.tensor(scores), iou_thr)
     return keep.cpu().numpy()
 
 def scale_coords(boxes, r, w0, h0):

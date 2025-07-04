@@ -83,4 +83,5 @@ test_evaluator = val_evaluator
 #           Иначе можно просто:
 test_dataloader = val_dataloader
 
+# TODO minimize max_epochs
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=150, val_interval=10)

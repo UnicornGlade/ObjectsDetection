@@ -11,11 +11,11 @@ python convert_aug_dataset_yolo2coco.py \
     --seed 42
 """
 from __future__ import annotations
-import argparse, json, os, shutil, random, glob, itertools
+import argparse, json, random, shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
-
+import re
 import cv2
 from tqdm import tqdm
 
@@ -23,65 +23,70 @@ from tqdm import tqdm
 # YOLO id : name ; COCO ids must start at 1, so we add +1 later.
 YOLO_CLASSES = ['car', 'bus', 'truck']
 
-
-# --------------------------------------------------------------------------- #
-def yolo_txt_to_boxes(txt_path: Path, W: int, H: int) -> List[Dict]:
-    """Read YOLO txt and return list of dicts: {cls_id, x, y, w, h} in pixels."""
-    boxes = []
-    if not txt_path.exists():
-        return boxes
-    with txt_path.open() as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) != 5:
-                continue
-            cls, xc, yc, bw, bh = map(float, parts)
-            xc *= W
-            yc *= H
-            bw *= W
-            bh *= H
-            x1 = xc - bw / 2
-            y1 = yc - bh / 2
-            boxes.append(
-                dict(
-                    cls_id=int(cls),
-                    x=float(x1),
-                    y=float(y1),
-                    w=float(bw),
-                    h=float(bh),
-                    area=float(bw * bh),
-                )
-            )
-    return boxes
+# ------------------------------------------------------------------------------------------------------------------
+def yolo_txt_to_boxes(txt: Path, W: int, H: int) -> List[Dict]:
+    """Read YOLO-format .txt and return list[{cls_id,x,y,w,h,area}] in pixels."""
+    out = []
+    if not txt.exists():
+        return out
+    for line in txt.read_text().strip().splitlines():
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        cls, xc, yc, bw, bh = map(float, parts)
+        xc, yc, bw, bh = xc * W, yc * H, bw * W, bh * H
+        out.append(dict(
+            cls_id=int(cls),
+            x=xc - bw / 2, y=yc - bh / 2, w=bw, h=bh,
+            area=bw * bh))
+    return out
 
 
-def build_coco_dict(
-    records: List[Dict], categories: List[Dict]
-) -> Dict:
-    """records = [{'img': {...}, 'ann': [...]}, ...]"""
-    coco = dict(
-        images=[],
-        annotations=[],
-        categories=categories,
-    )
-    ann_id = 1
+def build_coco(records: List[Dict], cats: List[Dict]) -> Dict:
+    coco, ann_id = dict(images=[], annotations=[], categories=cats), 1
     for r in records:
-        coco["images"].append(r["img"])
-        for box in r["ann"]:
-            coco["annotations"].append(
-                dict(
-                    id=ann_id,
-                    image_id=r["img"]["id"],
-                    category_id=box["cls_id"] + 1,  # +1 => 1..N
-                    bbox=[box["x"], box["y"], box["w"], box["h"]],
-                    area=box["area"],
-                    iscrowd=0,
-                )
-            )
+        coco['images'].append(r['img'])
+        for b in r['ann']:
+            coco['annotations'].append(dict(
+                id=ann_id, image_id=r['img']['id'],
+                category_id=b['cls_id'] + 1,
+                bbox=[b['x'], b['y'], b['w'], b['h']],
+                area=b['area'], iscrowd=0))
             ann_id += 1
     return coco
 
 
+# ------------------------------------------------------------------------------------------------------------------
+def group_key(p: Path) -> str:
+    """
+    Derive 'original' name → grouping key.
+
+    Handles "<name>.jpg"  , "<name>_aug3.jpg", "<prefix>_<name>_aug15.png".
+    The rule: cut the first "_aug\d*" suffix if present, else use full stem.
+    """
+    stem = p.stem
+    m = re.match(r'^(.*?)(_aug\d+)?$', stem)
+    return m.group(1) if m else stem
+
+
+def split_groups(imgs: List[Path], ratio: float, seed: int):
+    """Return (train_imgs, val_imgs) with group-preserving split."""
+    # build {key: [paths]}
+    groups = {}
+    for p in imgs:
+        groups.setdefault(group_key(p), []).append(p)
+
+    keys = list(groups)
+    random.Random(seed).shuffle(keys)
+    k = int(len(keys) * ratio)
+    train_keys = set(keys[:k])
+
+    train = list(itertools.chain.from_iterable(groups[k] for k in train_keys))
+    val   = list(itertools.chain.from_iterable(groups[k] for k in keys[k:]))
+    return train, val
+
+
+# ------------------------------------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="folder with images + .txt")
@@ -90,68 +95,45 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    src = Path(args.src)
-    dst = Path(args.dst)
+    src, dst = Path(args.src), Path(args.dst)
     dst.mkdir(parents=True, exist_ok=True)
 
-    # gather images
-    img_paths = sorted(
-        p for p in src.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-    )
-    random.seed(args.seed)
-    random.shuffle(img_paths)
+    img_paths = sorted(p for p in src.iterdir()
+                       if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
 
-    split_idx = int(len(img_paths) * args.train_ratio)
-    train_imgs = img_paths[:split_idx]
-    val_imgs = img_paths[split_idx:]
+    train_imgs, val_imgs = split_groups(img_paths, args.train_ratio, args.seed)
 
-    def process_subset(subset: List[Path], subset_name: str):
+    def process(subset: List[Path], name: str):
         records = []
-        for idx, img_path in enumerate(tqdm(subset, desc=subset_name)):
-            # copy image
-            dst_img = dst / img_path.name
-            shutil.copyfile(img_path, dst_img)
+        for img_path in tqdm(subset, desc=name):
+            shutil.copyfile(img_path, dst / img_path.name)
 
             img = cv2.imread(str(img_path))
             if img is None:
                 continue
             H, W = img.shape[:2]
-            txt_path = img_path.with_suffix(".txt")
-            boxes = yolo_txt_to_boxes(txt_path, W, H)
+            boxes = yolo_txt_to_boxes(img_path.with_suffix(".txt"), W, H)
+            records.append(dict(
+                img=dict(id=len(records) + 1,
+                         file_name=img_path.name, width=W, height=H),
+                ann=boxes))
 
-            records.append(
-                dict(
-                    img=dict(
-                        id=len(records) + 1,
-                        file_name=img_path.name,
-                        width=W,
-                        height=H,
-                    ),
-                    ann=boxes,
-                )
-            )
-
-        # categories section
-        categories = [
-            dict(id=i + 1, name=n, supercategory="vehicle")
-            for i, n in enumerate(YOLO_CLASSES)
-        ]
-        coco = build_coco_dict(records, categories)
-
-        coco['info'] = dict(
-            description='auto-converted YOLO → COCO',
-            version='1.0',
-            date_created=datetime.now().strftime('%Y-%m-%d'))
+        cats = [dict(id=i + 1, name=n, supercategory="vehicle")
+                for i, n in enumerate(YOLO_CLASSES)]
+        coco = build_coco(records, cats)
+        coco['info'] = dict(description='auto-converted YOLO → COCO',
+                            version='1.1',
+                            date_created=datetime.now().strftime('%Y-%m-%d'))
         coco['licenses'] = [dict(name='unknown', id=0)]
 
-        json_out = dst / f"instances_{subset_name}.json"
-        with json_out.open("w", encoding="utf-8") as f:
-            json.dump(coco, f, indent=2)
-        print(f"[✓] {json_out} written ({len(records)} images)")
+        (dst / f"instances_{name}.json").write_text(
+            json.dumps(coco, indent=2), encoding='utf-8')
+        print(f"[✓] instances_{name}.json written ({len(records)} images)")
 
-    process_subset(train_imgs, "train")
-    process_subset(val_imgs, "val")
+    process(train_imgs, "train")
+    process(val_imgs,   "val")
 
 
 if __name__ == "__main__":
+    import itertools, json
     main()
