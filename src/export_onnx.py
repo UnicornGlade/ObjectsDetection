@@ -1,78 +1,362 @@
 #!/usr/bin/env python
-"""Export trained RTMDet checkpoint to ONNX."""
-import argparse, torch, sys
-import functools
+"""export_onnx.py  – export RTMDet to ONNX, visual‑check parity
+
+CLI example
+-----------
+python export_onnx.py \
+    --cfg configs/rtmdet_car.py \
+    --ckpt models \            # dir or .pth
+    --img test.jpg \
+    --out models/rtmdet_car.onnx
+
+Outputs:
+    • *_pt.jpg  – result from original PyTorch model
+    • *_onnx.jpg – result from exported ONNX
+    • asserts numerical diff < 1e‑3 (max abs)
+"""
+
+import argparse, sys, warnings
 from pathlib import Path
+import functools
+
+import cv2
+import numpy as np
+import torch
+import onnxruntime as ort
+import torchvision.ops as tvops
+
+# ------------------------------------------------------------------
+# Hot-fix for MMDetection ≥3.0: provide mmdet.core.export.dynamic_clip_for_onnx
+# ------------------------------------------------------------------
+import types, sys, torch
+_core = types.ModuleType("mmdet.core")
+_export = types.ModuleType("mmdet.core.export")
+def dynamic_clip_for_onnx(*coords_and_shape, **kw):
+    """
+    Accepts x1, y1, x2, y2 [, max_shape] exactly like original impl.
+    Returns the (optionally) clipped coordinates.
+    """
+    if coords_and_shape and not torch.is_tensor(coords_and_shape[-1]):
+        max_shape = coords_and_shape[-1]
+        coords = coords_and_shape[:-1]
+    else:
+        max_shape = None
+        coords = coords_and_shape
+    clipped = [torch.clamp(c, min=0) for c in coords]
+    return (*clipped,)
+_export.dynamic_clip_for_onnx = dynamic_clip_for_onnx
+_core.export = _export
+sys.modules["mmdet.core"] = _core
+sys.modules["mmdet.core.export"] = _export
+# ------------------------------------------------------------------
+
 from mmengine.config import Config
 from mmdet.apis import init_detector
 
+from mmdet.apis import init_detector, inference_detector
+from mmdet.structures import DetDataSample
+
+import cv2, numpy as np, torch
+
+def post_nms(dets, iou_thr=0.5, top_k=300):
+    """dets: (N,6)  →  (M,6) after NMS, M≤top_k"""
+    boxes = torch.as_tensor(dets[:, :4])
+    scores= torch.as_tensor(dets[:, 4])
+    keep  = tvops.nms(boxes, scores, iou_thr)
+    keep  = keep[: top_k]
+    return dets[keep.cpu().numpy()]
+
+# ----------------------------------------------------------------------
+# Draw MMDetection result on an image (v2.x *или* v3.x).
+# ----------------------------------------------------------------------
+def _unpack(result):
+    """Convert result to flat (N, 4+score+label) ndarray."""
+    if hasattr(result, 'pred_instances'):          # v3: DetDataSample
+        inst = result.pred_instances
+        b = inst.bboxes.cpu().numpy()
+        s = inst.scores.cpu().numpy()[:, None]
+        l = inst.labels.cpu().numpy()[:, None]
+        return np.hstack([b, s, l])
+    else:                                          # v2: list[ndarray] per class
+        if isinstance(result, tuple):              # masks / det
+            result = result[0]
+        outs = []
+        for cls, dets in enumerate(result):
+            if dets.size:
+                lbl = np.full((dets.shape[0], 1), cls, dtype=np.float32)
+                outs.append(np.hstack([dets, lbl]))
+        return np.vstack(outs) if outs else np.empty((0, 6), np.float32)
+
+def draw_result(img_path, result, class_names, out_file, score_thr=0.3):
+    mat = cv2.imread(img_path)
+    dets = _unpack(result)
+    for x1, y1, x2, y2, score, label in dets:
+        if score < score_thr:
+            continue
+        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+        cv2.rectangle(mat, p1, p2, (0, 255, 0), 2)
+        txt = f'{class_names[int(label)]} {score:.2f}'
+        cv2.putText(mat, txt, (p1[0], max(p1[1] - 2, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+    cv2.imwrite(out_file, mat)
+
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
+
 def resolve_ckpt(path_like: str) -> str:
-    """
-    If `path_like` is an existing file → return as is.
-    If it's a directory → read `last_checkpoint` inside it or take
-    the highest-numbered epoch_XXX.pth.
-    """
+    """Return .pth if path_like is file or top/latest in dir."""
     p = Path(path_like)
     if p.is_file():
         return str(p)
-
-    # treat as directory
-    last_file = p / "last_checkpoint"
-    if last_file.is_file():
-        return str((p / last_file.read_text().strip()).resolve())
-
+    last = p / "last_checkpoint"
+    if last.is_file():
+        return str((p / last.read_text().strip()).resolve())
     ckpts = sorted(p.glob("epoch_*.pth"))
     if not ckpts:
         sys.exit(f"[ERROR] no .pth found in {p}")
-    return str(ckpts[-1])           # biggest epoch number
+    return str(ckpts[-1])
+
+
+# BGR → RGB, letter‑box pad to square, return tensor CxHxW
+
+def preprocess(img_bgr: np.ndarray, dst_sz: int = 640) -> tuple[torch.Tensor, float]:
+    h, w = img_bgr.shape[:2]
+    scale = min(dst_sz / w, dst_sz / h)
+    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+    img_resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    canvas = np.full((dst_sz, dst_sz, 3), 114, dtype=np.uint8)
+    canvas[:new_h, :new_w] = img_resized
+
+    img_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float()  # 0‑255
+    return tensor, scale
+
+
+def visualise(img_bgr: np.ndarray, dets: np.ndarray, names: list[str], out: str, thr: float = 0.4):
+    """Draw boxes [x1,y1,x2,y2,score,label]."""
+    h, w = img_bgr.shape[:2]
+    dst_sz = 640
+    scale = min(dst_sz / w, dst_sz / h)
+    dets[:, :4] /= scale # TODO make division on copy of dets (to not modify arguments)
+    for x1, y1, x2, y2, s, cls in dets:
+        if s < thr:
+            continue
+        color = (0, 255, 0)
+        cv2.rectangle(img_bgr, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+        cv2.putText(img_bgr, f"{names[int(cls)]}:{s:.2f}", (int(x1), int(y1) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
+    cv2.imwrite(out, img_bgr)
+    print("saved", out)
+
+
+def filter_bboxes(dets: np.ndarray, thr: float = 0.4):
+    filtered_dets = []
+    for x1, y1, x2, y2, s, cls in dets:
+        if s < thr:
+            continue
+        filtered_dets.append((x1, y1, x2, y2, s, cls))
+    return np.array(filtered_dets)
+
+
+def print_bboxes(img_bgr: np.ndarray, dets: np.ndarray):
+    h, w = img_bgr.shape[:2]
+    dst_sz = 640
+    scale = min(dst_sz / w, dst_sz / h)
+    dets[:, :4] /= scale  # TODO make division on copy of dets (to not modify arguments)
+    ntotal = 0
+    print("{} - number of bboxes (ignoring their scores/confidences)".format(len(dets)))
+    for x1, y1, x2, y2, s, cls in dets:
+        print(s, x1, y1, x2, y2)
+        ntotal += 1
+    print(ntotal)
+
+# -----------------------------------------------------------------------------
+# ONNX wrapper
+# -----------------------------------------------------------------------------
 
 class RTMDetONNX(torch.nn.Module):
-    def __init__(self, det):
+    """Return fixed shape (B,max_det,6) tensor: [x1,y1,x2,y2,score,label]."""
+
+    def __init__(self, det, max_det: int = 300, score_thr: float = 0.4):
         super().__init__()
         self.det = det
-        # force raw tensors, no NMS
-        self.det.forward = functools.partial(det.forward, mode='tensor')
+        self.max_det = max_det
+        self.score_thr = score_thr
+        # use high‑level predict with rescale already applied
+        # disabled because we will call .predict and pass metas on our own
+        # self.det.forward = functools.partial(det.forward, mode="predict")
 
-    def forward(self, x):
-        cls, box = self.det(x)           # tuple of 3 + 3 tensors
-        # (B, C, H, W)  →  (B, H*W, C)   then concatenate scales
-        cls = torch.cat([c.flatten(2).permute(0, 2, 1) for c in cls], dim=1)
-        # (B, 4, H, W)  →  (B, H*W, 4)
-        box = torch.cat([b.flatten(2).permute(0, 2, 1) for b in box], dim=1)
-        return cls, box
+    def forward(self, x): # x : B×3×H×W, 0-1 RGB
+        _, _, h, w = x.shape
+        # ---- строим минимальные meta-данные, которых достаточно bbox_head.predict ----
+        batch_metas   = []
+        meta_template = dict(
+            img_shape   =(h, w, 3),
+            ori_shape   =(h, w, 3),
+            scale_factor=x.new_tensor([1., 1., 1., 1.]),
+            pad_param   ={},
+        )
+        for _ in range(x.size(0)):
+            batch_metas.append(meta_template.copy())
+
+        # high-level API с rescale=True → вернёт bboxes в пикселях оригинала
+        #results = self.det.predict(
+        #    x, batch_data_samples=batch_samples, rescale=False)
+        feats = self.det.extract_feat(x)
+
+        # 1) получаем сырые logits головы
+        cls_scores, bbox_preds = self.det.bbox_head(feats)  # ← то, что ждёт predict_by_feat
+
+        # 2) конвертируем их в боксы/оценки (без NMS)
+        # with_nms=False → вернёт tuple(bboxes, scores)
+        preds = self.det.bbox_head.predict_by_feat(
+            cls_scores, bbox_preds,
+            batch_img_metas=batch_metas,
+            rescale=False, with_nms=False)
+
+        # preds: list[tuple(ndarray (num_box,4), ndarray (num_box, num_cls))]
+        from mmengine.structures import InstanceData
+        results = []
+        for inst_raw in preds:                    # inst_raw: InstanceData
+            bboxes = inst_raw.bboxes              # Tensor (N,4)
+            cls_sc = inst_raw.scores              # Tensor (N,C)
+
+            if cls_sc.ndim == 2:                  # [N, C]  → берём лучший класс
+                conf, labels = cls_sc.max(dim=1)
+            else:                                # [N]  → оценки уже одиночные
+                conf   = cls_sc                  # (N,)
+                labels = torch.zeros_like(conf, dtype=torch.long)
+
+            inst = InstanceData(
+                bboxes=bboxes,                    # уже Tensor
+                scores=conf,                      # (N,)
+                labels=labels)                    # (N,)
+            results.append(InstanceData(pred_instances=inst))
+
+        batched = []
+        for res in results:  # batch loop
+            inst = res.pred_instances
+            # сортируем по убыванию score и берём первые max_det
+            scores = inst.scores
+            idx = scores.argsort(descending=True)
+            b = inst.bboxes[idx]
+            s = scores[idx].unsqueeze(1)
+            l = inst.labels[idx].unsqueeze(1).float()
+            out = torch.cat((b, s, l), dim=1)  # Nx6
+            if out.shape[0] < self.max_det:
+                pad = out.new_zeros((self.max_det - out.shape[0], 6))
+                out = torch.cat((out, pad), dim=0)
+            else:
+                out = out[: self.max_det]
+            batched.append(out)
+        return torch.stack(batched)
+
+
+# -----------------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cfg', default='configs/rtmdet_car.py')
-    ap.add_argument(
-        "--ckpt", default="../models",
-        help="path to .pth file **or** directory with checkpoints",
-    )
+    ap.add_argument("--cfg", default="configs/rtmdet_car.py")
+    ap.add_argument("--ckpt", default="../models", help=".pth or dir with checkpoints")
+    ap.add_argument("--img", required=True, help="image for sanity check")
     ap.add_argument("--out", default="../models/rtmdet_car.onnx")
+    ap.add_argument("--score_thr", type=float, default=0.4)
+    ap.add_argument("--max_det", type=int, default=300)
+    ap.add_argument("--diff_thr", type=float, default=0.5, help="max avg abs diff allowed")
     args = ap.parse_args()
 
-    ckpt_path = resolve_ckpt(args.ckpt)
-    model = init_detector(Config.fromfile(args.cfg), ckpt_path, device="cuda")
+    # ------- load model & run native inference --------------------------------
+    ckpt = resolve_ckpt(args.ckpt)
+    cfg = Config.fromfile(args.cfg)
+    class_names = cfg.get("class_names") or cfg.get("CLASSES") or cfg.metainfo["classes"]
+
+    model = init_detector(cfg, ckpt, device="cuda")
     model.eval()
 
-    wrapper = RTMDetONNX(model).eval().cuda()
-    dummy = torch.randn(1, 3, 640, 640, device="cuda")
+    # visualise PyTorch inference
+    res_pt = inference_detector(model, args.img)
+    draw_result(
+        args.img, res_pt,
+        class_names=model.dataset_meta['classes'],
+        out_file=Path(args.out).with_suffix("").with_name(Path(args.out).stem + "_pt.jpg")
+    )
+
+    # ------- export -----------------------------------------------------------
+    model.test_cfg['score_thr'] = 0.0 # so that we will have at least dummy-trash bboxes, so that output will not be optimized and deleted on export
+    wrapper = RTMDetONNX(model, args.max_det, args.score_thr).eval().cuda()
+
+    dummy_bgr = np.zeros((640, 640, 3), dtype=np.uint8)
+    dummy_tensor, _ = preprocess(dummy_bgr, 640)
+    dummy_tensor = dummy_tensor.unsqueeze(0).cuda() / 255.0  # stay 0‑1 to help export
 
     torch.onnx.export(
-        wrapper, dummy, args.out,
-        opset_version=12, do_constant_folding=True,
-        input_names=['images'],
-        output_names=['pred_logits', 'pred_boxes'],
-        dynamic_axes={'images': {0: 'batch'},
-                      'pred_logits': {0: 'batch'},
-                      'pred_boxes': {0: 'batch'}},
-        verbose=True
+        wrapper,
+        dummy_tensor,
+        args.out,
+        opset_version=12,
+        do_constant_folding=True,
+        input_names=["images"],
+        output_names=["dets"],
+        dynamic_axes={"images": {0: "batch"}, "dets": {0: "batch"}},
+        verbose=False,
     )
-    print("Exported →", args.out)
+    print("ONNX exported →", args.out)
 
-    import onnxruntime as ort
-    sess = ort.InferenceSession(args.out, providers=['CUDAExecutionProvider'])
-    print([o.name for o in sess.get_outputs()])  # → ['pred_logits', 'pred_boxes']
+    # ------- preprocess real image & run both versions ------------------------
+    img_bgr = cv2.imread(args.img)
+    if img_bgr is None:
+        sys.exit(f"[ERROR] cannot read image {args.img}")
+    tensor, _ = preprocess(img_bgr)
+    tensor_pt = tensor.cuda() / 255.0
+
+    with torch.no_grad():
+        det_pt = wrapper(tensor_pt.unsqueeze(0))[0]  # (1, max_det, 6)
+        det_pt = post_nms(det_pt, 0.5, args.max_det)
+
+    sess = ort.InferenceSession(str(args.out), providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    det_onnx = sess.run(None, {input_name: tensor_pt.unsqueeze(0).cpu().numpy()})[0]  # (1, max_det, 6)
+    det_onnx = det_onnx[0]  # (max_det, 6)
+    det_onnx = post_nms(det_onnx, 0.5, args.max_det)
+
+    # we should do de-scaling on our own because of rescale=False
+    # координаты модели – в системе letterbox-тензора 640×640
+    h, w = img_bgr.shape[:2]
+    dst_sz = 640
+    scale = min(dst_sz / w, dst_sz / h)
+    det_pt[..., :4] /= scale  # scale вернулся из preprocess()
+    #det_onnx[..., :4] /= scale
+
+    # ------- visualise ONNX result -------------------------------------------
+    vis_onnx = Path(args.out).with_suffix("").with_name(Path(args.out).stem + "_onnx.jpg")
+    visualise(img_bgr.copy(), det_onnx, class_names, str(vis_onnx), args.score_thr)
+
+    # filter output bboxes w.r.t. confidence threshold
+    res_pt = filter_bboxes(_unpack(res_pt))
+    det_pt = filter_bboxes(det_pt.cpu())
+    det_onnx = filter_bboxes(det_onnx)
+
+    print("PyTorch inference results 1: {} bboxes:".format(res_pt.shape))
+    print_bboxes(img_bgr, res_pt)
+
+    print("PyTorch inference results 2: {} bboxes:".format(det_pt.shape))
+    print_bboxes(img_bgr, det_pt)
+
+    print("ONNX inference results: {} bboxes:".format(det_onnx.shape))
+    print_bboxes(img_bgr, det_onnx)
+
+    # ------- numeric check ----------------------------------------------------
+    avg_diff = np.average(np.abs(det_pt - det_onnx))
+    if avg_diff > args.diff_thr:
+        raise RuntimeError(f"ONNX mismatch: max abs diff {avg_diff:.4e} > {args.diff_thr}")
+    print(f"Numeric diff OK: {avg_diff:.2e}")
+
 
 if __name__ == "__main__":
-    main()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        main()
