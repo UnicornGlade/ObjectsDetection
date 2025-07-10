@@ -244,12 +244,18 @@ class RTMDetONNX(torch.nn.Module):
             b = inst.bboxes[idx]
             s = scores[idx].unsqueeze(1)
             l = inst.labels[idx].unsqueeze(1).float()
-            out = torch.cat((b, s, l), dim=1)  # Nx6
-            if out.shape[0] < self.max_det:
-                pad = out.new_zeros((self.max_det - out.shape[0], 6))
-                out = torch.cat((out, pad), dim=0)
-            else:
-                out = out[: self.max_det]
+
+            out = torch.cat((b, s, l), dim=1)  # (N, 6)
+
+            # 1. обрезаем избыток, чтобы N ≤ max_det
+            out = out[: self.max_det]  # (min(N,max_det), 6)
+
+            # 2. если боксов меньше max_det – дополняем нулями
+            pad_rows = self.max_det - out.shape[0]  # всегда ≥ 0 после обрезки
+            if pad_rows:  # pad_rows == 0 → ничего не делаем
+                pad = out.new_zeros((pad_rows, 6))
+                out = torch.cat((out, pad), dim=0)  # (max_det, 6)
+
             batched.append(out)
         return torch.stack(batched)
 
