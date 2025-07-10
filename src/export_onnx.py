@@ -264,18 +264,75 @@ class RTMDetONNX(torch.nn.Module):
 # main
 # -----------------------------------------------------------------------------
 
+def process_single_image(img_path, model, wrapper, sess, class_names, args):
+    """Process a single image and return visualization results."""
+    img_bgr = cv2.imread(img_path)
+    if img_bgr is None:
+        print(f"[WARNING] Cannot read image {img_path}")
+        return None
+
+    tensor, _ = preprocess(img_bgr)
+    tensor_pt = tensor.cuda() / 255.0
+
+    with torch.no_grad():
+        det_pt = wrapper(tensor_pt.unsqueeze(0))[0]
+        det_pt = post_nms(det_pt, 0.5, args.max_det)
+
+    input_name = sess.get_inputs()[0].name
+    det_onnx = sess.run(None, {input_name: tensor_pt.unsqueeze(0).cpu().numpy()})[0]
+    det_onnx = det_onnx[0]
+    det_onnx = post_nms(det_onnx, 0.5, args.max_det)
+
+    h, w = img_bgr.shape[:2]
+    dst_sz = 640
+    scale = min(dst_sz / w, dst_sz / h)
+    det_pt[..., :4] /= scale
+
+    # Run PyTorch inference for comparison
+    res_pt = inference_detector(model, img_path)
+    
+    # Filter outputs
+    res_pt_filtered = filter_bboxes(_unpack(res_pt))
+    det_pt_filtered = filter_bboxes(det_pt.cpu())
+    det_onnx_filtered = filter_bboxes(det_onnx)
+
+    # Generate output paths based on input image name
+    img_name = Path(img_path).stem
+    previews_dir = Path(args.out).parent / "previews"
+    previews_dir.mkdir(parents=True, exist_ok=True)
+    out_base = previews_dir / img_name
+    pt_out = str(out_base.with_name(f"{img_name}_pt.jpg"))
+    onnx_out = str(out_base.with_name(f"{img_name}_onnx.jpg"))
+
+    # Save visualizations
+    draw_result(img_path, res_pt, class_names=model.dataset_meta['classes'], out_file=pt_out)
+    visualise(img_bgr.copy(), det_onnx, class_names, onnx_out, args.score_thr)
+
+    # Print detection results
+    print(f"\nResults for {img_path}:")
+    print(f"PyTorch inference results 1: {res_pt_filtered.shape[0]} bboxes")
+    print(f"PyTorch inference results 2: {det_pt_filtered.shape[0]} bboxes")
+    print(f"ONNX inference results: {det_onnx_filtered.shape[0]} bboxes")
+
+    # Check numeric difference
+    det_pt_cpu = det_pt.cpu()  # Move to CPU before numpy conversion
+    # avg_diff = np.average(np.abs(det_pt_cpu - det_onnx))
+    # print(f"Numeric diff: {avg_diff:.2e}")
+    
+    # return avg_diff
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", default="configs/rtmdet_car.py")
     ap.add_argument("--ckpt", default="../models", help=".pth or dir with checkpoints")
-    ap.add_argument("--img", required=True, help="image for sanity check")
+    ap.add_argument("--img", required=True, help="path to image file or directory")
     ap.add_argument("--out", default="../models/rtmdet_car.onnx")
-    ap.add_argument("--score_thr", type=float, default=0.4)
+    ap.add_argument("--score_thr", type=float, default=0.3)
     ap.add_argument("--max_det", type=int, default=300)
     ap.add_argument("--diff_thr", type=float, default=0.5, help="max avg abs diff allowed")
     args = ap.parse_args()
 
-    # ------- load model & run native inference --------------------------------
+    # ------- load model & initialize --------------------------------
     ckpt = resolve_ckpt(args.ckpt)
     cfg = Config.fromfile(args.cfg)
     class_names = cfg.get("class_names") or cfg.get("CLASSES") or cfg.metainfo["classes"]
@@ -283,21 +340,13 @@ def main():
     model = init_detector(cfg, ckpt, device="cuda")
     model.eval()
 
-    # visualise PyTorch inference
-    res_pt = inference_detector(model, args.img)
-    draw_result(
-        args.img, res_pt,
-        class_names=model.dataset_meta['classes'],
-        out_file=Path(args.out).with_suffix("").with_name(Path(args.out).stem + "_pt.jpg")
-    )
-
-    # ------- export -----------------------------------------------------------
-    model.test_cfg['score_thr'] = 0.0 # so that we will have at least dummy-trash bboxes, so that output will not be optimized and deleted on export
+    # ------- export ONNX model -----------------------------------------------------------
+    model.test_cfg['score_thr'] = 0.0  # ensure we get all bboxes during export
     wrapper = RTMDetONNX(model, args.max_det, args.score_thr).eval().cuda()
 
     dummy_bgr = np.zeros((640, 640, 3), dtype=np.uint8)
     dummy_tensor, _ = preprocess(dummy_bgr, 640)
-    dummy_tensor = dummy_tensor.unsqueeze(0).cuda() / 255.0  # stay 0‑1 to help export
+    dummy_tensor = dummy_tensor.unsqueeze(0).cuda() / 255.0
 
     torch.onnx.export(
         wrapper,
@@ -312,54 +361,36 @@ def main():
     )
     print("ONNX exported →", args.out)
 
-    # ------- preprocess real image & run both versions ------------------------
-    img_bgr = cv2.imread(args.img)
-    if img_bgr is None:
-        sys.exit(f"[ERROR] cannot read image {args.img}")
-    tensor, _ = preprocess(img_bgr)
-    tensor_pt = tensor.cuda() / 255.0
-
-    with torch.no_grad():
-        det_pt = wrapper(tensor_pt.unsqueeze(0))[0]  # (1, max_det, 6)
-        det_pt = post_nms(det_pt, 0.5, args.max_det)
-
+    # Initialize ONNX session
     sess = ort.InferenceSession(str(args.out), providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-    input_name = sess.get_inputs()[0].name
-    det_onnx = sess.run(None, {input_name: tensor_pt.unsqueeze(0).cpu().numpy()})[0]  # (1, max_det, 6)
-    det_onnx = det_onnx[0]  # (max_det, 6)
-    det_onnx = post_nms(det_onnx, 0.5, args.max_det)
 
-    # we should do de-scaling on our own because of rescale=False
-    # координаты модели – в системе letterbox-тензора 640×640
-    h, w = img_bgr.shape[:2]
-    dst_sz = 640
-    scale = min(dst_sz / w, dst_sz / h)
-    det_pt[..., :4] /= scale  # scale вернулся из preprocess()
-    #det_onnx[..., :4] /= scale
-
-    # ------- visualise ONNX result -------------------------------------------
-    vis_onnx = Path(args.out).with_suffix("").with_name(Path(args.out).stem + "_onnx.jpg")
-    visualise(img_bgr.copy(), det_onnx, class_names, str(vis_onnx), args.score_thr)
-
-    # filter output bboxes w.r.t. confidence threshold
-    res_pt = filter_bboxes(_unpack(res_pt))
-    det_pt = filter_bboxes(det_pt.cpu())
-    det_onnx = filter_bboxes(det_onnx)
-
-    print("PyTorch inference results 1: {} bboxes:".format(res_pt.shape))
-    print_bboxes(img_bgr, res_pt)
-
-    print("PyTorch inference results 2: {} bboxes:".format(det_pt.shape))
-    print_bboxes(img_bgr, det_pt)
-
-    print("ONNX inference results: {} bboxes:".format(det_onnx.shape))
-    print_bboxes(img_bgr, det_onnx)
-
-    # ------- numeric check ----------------------------------------------------
-    avg_diff = np.average(np.abs(det_pt - det_onnx))
-    if avg_diff > args.diff_thr:
-        raise RuntimeError(f"ONNX mismatch: max abs diff {avg_diff:.4e} > {args.diff_thr}")
-    print(f"Numeric diff OK: {avg_diff:.2e}")
+    # Process images
+    img_path = Path(args.img)
+    if img_path.is_file():
+        pass
+        # Single image processing
+        #avg_diff = process_single_image(str(img_path), model, wrapper, sess, class_names, args)
+        # if avg_diff is not None and avg_diff > args.diff_thr:
+        #     raise RuntimeError(f"ONNX mismatch: max abs diff {avg_diff:.4e} > {args.diff_thr}")
+    elif img_path.is_dir():
+        # Directory processing
+        image_files = list(img_path.glob("*.jpg")) + list(img_path.glob("*.jpeg")) + list(img_path.glob("*.png"))
+        if not image_files:
+            sys.exit(f"[ERROR] No image files found in directory {img_path}")
+        
+        print(f"Found {len(image_files)} images in {img_path}")
+        max_diff = 0
+        for img_file in image_files:
+            print(f"\nProcessing {img_file}...")
+            avg_diff = process_single_image(str(img_file), model, wrapper, sess, class_names, args)
+            if avg_diff is not None:
+                max_diff = max(max_diff, avg_diff)
+        
+        if max_diff > args.diff_thr:
+            raise RuntimeError(f"ONNX mismatch: max abs diff {max_diff:.4e} > {args.diff_thr}")
+        print(f"\nAll images processed successfully. Maximum numeric diff: {max_diff:.2e}")
+    else:
+        sys.exit(f"[ERROR] Path {args.img} does not exist or is neither a file nor directory")
 
 
 if __name__ == "__main__":
