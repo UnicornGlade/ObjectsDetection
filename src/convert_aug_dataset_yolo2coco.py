@@ -62,10 +62,12 @@ def group_key(p: Path) -> str:
     Derive 'original' name → grouping key.
 
     Handles "<name>.jpg"  , "<name>_aug3.jpg", "<prefix>_<name>_aug15.png".
-    The rule: cut the first "_aug\d*" suffix if present, else use full stem.
+    The rule: cut the "_aug\d*" suffix if present, else use full stem.
+    This ensures all augmented versions of the same original image are grouped together.
     """
     stem = p.stem
-    m = re.match(r'^(.*?)(_aug\d+)?$', stem)
+    # Remove any _augN suffix to get the original image name
+    m = re.match(r'^(.+?)_aug\d+$', stem)
     return m.group(1) if m else stem
 
 
@@ -74,7 +76,14 @@ def split_groups(imgs: List[Path], ratio: float, seed: int):
     # build {key: [paths]}
     groups = {}
     for p in imgs:
-        groups.setdefault(group_key(p), []).append(p)
+        key = group_key(p)
+        groups.setdefault(key, []).append(p)
+    
+    # Print some statistics about the grouping
+    print(f"Found {len(groups)} unique image groups")
+    aug_counts = [len(paths) for paths in groups.values()]
+    if aug_counts:
+        print(f"Augmentations per image: min={min(aug_counts)}, max={max(aug_counts)}, avg={sum(aug_counts)/len(aug_counts):.1f}")
 
     keys = list(groups)
     random.Random(seed).shuffle(keys)
@@ -83,6 +92,10 @@ def split_groups(imgs: List[Path], ratio: float, seed: int):
 
     train = list(itertools.chain.from_iterable(groups[k] for k in train_keys))
     val   = list(itertools.chain.from_iterable(groups[k] for k in keys[k:]))
+
+    print(f"Split dataset: {len(train)} images for training, {len(val)} images for validation")
+    print(f"Original images: {len(train_keys)} in training, {len(keys) - len(train_keys)} in validation")
+
     return train, val
 
 
