@@ -33,6 +33,8 @@ import cv2  # type: ignore
 import numpy as np
 import onnxruntime as ort
 
+from export_onnx import preprocess, post_nms, filter_bboxes
+
 # -----------------------------------------------------------------------------
 # Constants (adapt if your model differs)
 # -----------------------------------------------------------------------------
@@ -48,29 +50,6 @@ COLORS: Tuple[Tuple[int, int, int], ...] = (
 # -----------------------------------------------------------------------------
 # Pre‑processing helpers
 # -----------------------------------------------------------------------------
-
-def preprocess(img: np.ndarray, new_size: int = 640) -> Tuple[np.ndarray, float, Tuple[int, int]]:
-    """Resize with upper‑left letterbox padding.
-
-    Returns
-    -------
-    blob : np.ndarray
-        CHW float32 RGB image, values in [0,1].
-    r : float
-        Scale factor applied w.r.t. the larger side.
-    orig_shape : tuple[int, int]
-        (w0, h0) of the original image.
-    """
-    h0, w0 = img.shape[:2]
-    r = new_size / max(h0, w0)
-
-    resized = cv2.resize(img, (int(w0 * r), int(h0 * r)))
-    canvas = np.full((new_size, new_size, 3), 114, dtype=np.uint8)
-    canvas[: resized.shape[0], : resized.shape[1]] = resized
-
-    blob = canvas[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
-    return blob, r, (w0, h0)
-
 
 def scale_coords(boxes: np.ndarray, r: float, w0: int, h0: int) -> np.ndarray:
     """Map boxes from 640×640 letterboxed back to original image size."""
@@ -192,36 +171,27 @@ def main() -> None:  # noqa: C901
             print(f"[WARN] Can't read {path}")
             continue
 
-        blob, r, (w0, h0) = preprocess(img_bgr)
-        logits, raw_boxes = sess.run(None, {"images": blob[np.newaxis]})
-        logits = logits.squeeze(0).astype(np.float32)      # (8400, C)
-        raw_boxes = raw_boxes.squeeze(0).astype(np.float32)  # (8400,4)
+        tensor, scale = preprocess(img_bgr)
+        tensor_pt = tensor.cuda() / 255.0
 
-        # Decode distances -> xyxy in letterboxed space
-        boxes = decode_rtm(raw_boxes)
+        input_name = sess.get_inputs()[0].name
+        det_onnx = sess.run(None, {input_name: tensor_pt.unsqueeze(0).cpu().numpy()})[0]
+        det_onnx = det_onnx[0]
+        det_onnx = post_nms(det_onnx, 0.5)
 
-        # Convert logits to class + score
-        scores = logits.max(1).astype(np.float32)          # (8400,)
-        cls_ids = logits.argmax(1).astype(np.int32)
+        boxes = filter_bboxes(det_onnx)
+        boxes[:, :4] /= scale
 
-        mask = scores > args.thr
-        boxes, scores, cls_ids = boxes[mask], scores[mask], cls_ids[mask]
         if boxes.size == 0:
             continue
 
-        # NMS
-        keep = nms(boxes, scores, 0.55)
-        boxes, scores, cls_ids = boxes[keep], scores[keep], cls_ids[keep]
-
-        # Rescale back to original image size
-        boxes = scale_coords(boxes, r, w0, h0).astype(int)
-
         # Draw detections
-        for (x1, y1, x2, y2), score, cid in zip(boxes, scores, cls_ids):
-            color = COLORS[cid % len(COLORS)]
+        for x1, y1, x2, y2, score, cid in boxes:
+            cid = int(cid)
             color = (0, 0, 255)
 
-            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 200)
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 20)
             label = f"{CLS[cid]} {score:.2f}"
             cv2.putText(
                 img_bgr,
@@ -230,7 +200,7 @@ def main() -> None:  # noqa: C901
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 color,
-                200,
+                20,
                 cv2.LINE_AA,
             )
 

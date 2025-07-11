@@ -179,7 +179,7 @@ def print_bboxes(img_bgr: np.ndarray, dets: np.ndarray):
 class RTMDetONNX(torch.nn.Module):
     """Return fixed shape (B,max_det,6) tensor: [x1,y1,x2,y2,score,label]."""
 
-    def __init__(self, det, max_det: int = 300, score_thr: float = 0.4):
+    def __init__(self, det, score_thr: float = 0.4, max_det: int = 300):
         super().__init__()
         self.det = det
         self.max_det = max_det
@@ -276,12 +276,12 @@ def process_single_image(img_path, model, wrapper, sess, class_names, args):
 
     with torch.no_grad():
         det_pt = wrapper(tensor_pt.unsqueeze(0))[0]
-        det_pt = post_nms(det_pt, 0.5, args.max_det)
+        det_pt = post_nms(det_pt, 0.5)
 
     input_name = sess.get_inputs()[0].name
     det_onnx = sess.run(None, {input_name: tensor_pt.unsqueeze(0).cpu().numpy()})[0]
     det_onnx = det_onnx[0]
-    det_onnx = post_nms(det_onnx, 0.5, args.max_det)
+    det_onnx = post_nms(det_onnx, 0.5)
 
     h, w = img_bgr.shape[:2]
     dst_sz = 640
@@ -328,7 +328,6 @@ def main():
     ap.add_argument("--img", required=True, help="path to image file or directory")
     ap.add_argument("--out", default="../models/rtmdet_car.onnx")
     ap.add_argument("--score_thr", type=float, default=0.3)
-    ap.add_argument("--max_det", type=int, default=300)
     ap.add_argument("--diff_thr", type=float, default=0.5, help="max avg abs diff allowed")
     args = ap.parse_args()
 
@@ -342,7 +341,7 @@ def main():
 
     # ------- export ONNX model -----------------------------------------------------------
     model.test_cfg['score_thr'] = 0.0  # ensure we get all bboxes during export
-    wrapper = RTMDetONNX(model, args.max_det, args.score_thr).eval().cuda()
+    wrapper = RTMDetONNX(model, args.score_thr).eval().cuda()
 
     dummy_bgr = np.zeros((640, 640, 3), dtype=np.uint8)
     dummy_tensor, _ = preprocess(dummy_bgr, 640)
