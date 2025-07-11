@@ -30,6 +30,7 @@ setup(
         'mmengine>=0.10.3',
         'mmdet>=3.2.0',
         'albumentations>=1.4.0',
+        'tensorboard>=2.19.0',
         'opencv-python>=4.10.0',
         'onnx>=1.16.0',
         'onnxruntime-gpu>=1.18.0',

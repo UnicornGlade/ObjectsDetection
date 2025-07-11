@@ -85,3 +85,25 @@ test_dataloader = val_dataloader
 
 # TODO minimize max_epochs
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=150, val_interval=10)
+
+# Enable TensorBoard logging
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='TensorboardVisBackend'),
+]
+
+visualizer = dict(
+    type='DetLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer'
+)
+
+# Configure logging hooks
+default_hooks = dict(
+    timer=dict(type='IterTimerHook'),
+    logger=dict(type='LoggerHook', interval=50),
+    param_scheduler=dict(type='ParamSchedulerHook'),
+    checkpoint=dict(type='CheckpointHook', interval=10, max_keep_ckpts=3),
+    sampler_seed=dict(type='DistSamplerSeedHook'),
+    visualization=dict(type='DetVisualizationHook')
+)
