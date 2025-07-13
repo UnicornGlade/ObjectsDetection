@@ -11,6 +11,12 @@ model = dict(
 
 img_scale = (640, 640)
 
+TRAIN_SUBSET_SIZE = 1000
+VAL_SUBSET_SIZE = 200
+
+MAX_EPOCHS = 1000
+VAL_EPOCHS_INTERVAL = 10
+
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
@@ -36,6 +42,11 @@ train_pipeline = [
 
 train_dataloader = dict(
     batch_size=32,
+    sampler=dict(
+        type='RandomFixedCountSampler',
+        subset_size=TRAIN_SUBSET_SIZE,
+        shuffle=True,
+        seed=0),
     dataset=dict(
         type='CocoDataset',
         data_root='data/dataset01_tiles640/',
@@ -48,9 +59,14 @@ train_dataloader = dict(
 val_dataloader = dict(
     _delete_=True,                     # полностью перезаписываем
     batch_size=32,
+    sampler=dict(
+        type='RandomFixedCountSampler',
+        subset_size=VAL_SUBSET_SIZE,
+        shuffle=True,
+        static_subset=True, # fix subset for all epochs
+        seed=0),
     num_workers=4,
     persistent_workers=True,
-    sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type='CocoDataset',
         data_root='data/dataset01_tiles640/',   # ← ваша новая папка
@@ -84,7 +100,7 @@ test_evaluator = val_evaluator
 test_dataloader = val_dataloader
 
 # TODO minimize max_epochs
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=150, val_interval=10)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=MAX_EPOCHS, val_interval=VAL_EPOCHS_INTERVAL)
 
 # Enable TensorBoard logging
 vis_backends = [
