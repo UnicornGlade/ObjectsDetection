@@ -29,7 +29,7 @@ if sys.version_info[:2] == (3, 11):
 setup(
     name='objects-detection',
     version='0.1.0',
-    python_requires='==3.11',
+    python_requires='>=3.11',
     packages=find_packages(where='src'),
     package_dir={'': 'src'},
     install_requires=[

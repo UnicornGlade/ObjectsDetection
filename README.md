@@ -1,3 +1,22 @@
+# How to install mmcv on Python 3.12
+
+**mmcv** doesn't support Python 3.12+, so it is recommended to use Python 3.11 - see https://github.com/open-mmlab/mmcv/issues/3263
+
+But if needed you can try to build mmcv for python 3.12 from source code:
+
+```
+git clone --branch v2.1.0 https://github.com/open-mmlab/mmcv
+cd mmcv
+
+# delete line "-r requirements/test.txt" from mmcv/requirements.txt - because onnxoptimizer can't be installed on Python 3.12
+
+pip install -r requirements.txt
+
+set MMCV_WITH_OPS=1
+$Env:MMCV_WITH_OPS = 1
+python setup.py develop
+```
+
 # Installation
 
 Install torch with CUDA support:
