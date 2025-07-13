@@ -20,6 +20,7 @@ python -m pip install -e .
 But sadly I still wasn't able to get over this error on starting training:
 
 <details>
+<pre>
 Traceback (most recent call last):
   File "C:\...\src\train_rtmdet.py", line 100, in <module>
     main()
@@ -89,6 +90,7 @@ Traceback (most recent call last):
     return _bootstrap._gcd_import(name[level:], package, level)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ModuleNotFoundError: No module named 'mmcv._ext'
+</pre>
 </details>
 
 # Installation
