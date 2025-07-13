@@ -35,10 +35,10 @@ train_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=8,
+    batch_size=32,
     dataset=dict(
         type='CocoDataset',
-        data_root='data/dataset01_aug_coco/',
+        data_root='data/dataset01_tiles640/',
         ann_file='instances_train.json',
         data_prefix=dict(img=''),
         metainfo=dict(classes=class_names),
@@ -47,13 +47,13 @@ train_dataloader = dict(
 
 val_dataloader = dict(
     _delete_=True,                     # полностью перезаписываем
-    batch_size=4,
+    batch_size=32,
     num_workers=4,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type='CocoDataset',
-        data_root='data/dataset01_aug_coco/',   # ← ваша новая папка
+        data_root='data/dataset01_tiles640/',   # ← ваша новая папка
         ann_file='instances_val.json',          # ← файл, который создал скрипт
         data_prefix=dict(img=''),               # картинки лежат прямо в корне
         test_mode=True,
@@ -72,7 +72,7 @@ val_dataloader = dict(
 val_evaluator = dict(
     _delete_=True,
     type='CocoMetric',
-    ann_file='data/dataset01_aug_coco/instances_val.json',      # тот же, что выше
+    ann_file='data/dataset01_tiles640/instances_val.json',      # тот же, что выше
     metric='bbox',
     format_only=False)
 test_evaluator = val_evaluator
