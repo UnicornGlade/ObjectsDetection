@@ -3,6 +3,10 @@ import sys, subprocess
 
 CUDA_TAG = 'cu121'  # change if you use another CUDA toolkit build
 
+def _install_torch():
+    # pip install torch==2.3.0+cu121 torchvision==0.18.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'torch==2.3.0+cu121', 'torchvision==0.18.0+cu121', '--extra-index-url', 'https://download.pytorch.org/whl/cu121'])
+
 def _install_mmcv():
     # see https://github.com/open-mmlab/mmcv?tab=readme-ov-file#install-mmcv
     # pip install -U openmim
@@ -15,6 +19,7 @@ def _download_pretrained():
     # mim download mmdet --config rtmdet_tiny_8xb32-300e_coco --dest pretrained
     subprocess.check_call([sys.executable, '-m', 'mim', 'download', 'mmdet', '--config', 'rtmdet_tiny_8xb32-300e_coco', '--dest', 'pretrained'])
 
+_install_torch()
 _install_mmcv()
 _download_pretrained()
 
