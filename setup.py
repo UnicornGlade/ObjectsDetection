@@ -14,6 +14,11 @@ def _install_mmcv():
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-U', 'openmim'])
     subprocess.check_call([sys.executable, '-m', 'mim', 'install', 'mmcv==2.1.0'])
 
+def _install_mmdet():
+    # we run it explicitly so that _download_pretrained() can proceed (it requires mmdet)
+    # pip install mmengine>=0.10.3 mmdet>=3.2.0
+    subprocess.check_call([sys.executable, '-m', 'mim', 'install', 'mmengine>=0.10.3', 'mmdet>=3.2.0'])
+
 def _download_pretrained():
     # used in autolabel.py and in train_rtdetr.py
     # mim download mmdet --config rtmdet_tiny_8xb32-300e_coco --dest pretrained
@@ -21,6 +26,7 @@ def _download_pretrained():
 
 _install_torch()
 _install_mmcv()
+_install_mmdet()
 _download_pretrained()
 
 setup(
@@ -32,8 +38,6 @@ setup(
     install_requires=[
         f'torch==2.3.0+{CUDA_TAG}',
         f'torchvision==0.18.0+{CUDA_TAG}',
-        'mmengine>=0.10.3',
-        'mmdet>=3.2.0',
         'albumentations>=1.4.0',
         'tensorboard>=2.19.0',
         'opencv-python>=4.10.0',
