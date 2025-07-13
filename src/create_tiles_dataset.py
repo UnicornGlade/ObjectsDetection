@@ -255,7 +255,7 @@ class TileGenerator:
             
             # Save augmented image
             aug_filename = f"{base_filename}_aug{aug_idx}.jpg"
-            aug_image_path = os.path.join(output_dir, "images", aug_filename)
+            aug_image_path = os.path.join(output_dir, aug_filename)
             cv2.imwrite(aug_image_path, aug_image)
             
             # Save augmented annotations
@@ -331,7 +331,7 @@ class TileGenerator:
         
         for tile_data in all_selected_tiles:
             # Save tile image
-            tile_path = os.path.join(output_dir, "images", tile_data['filename'])
+            tile_path = os.path.join(output_dir, tile_data['filename'])
             cv2.imwrite(tile_path, tile_data['image'])
             
             # Create COCO image entry
@@ -456,7 +456,6 @@ class TileGenerator:
         
         # Create output directories
         os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
         
         # Find all image files with annotations (deduplicate by stem name)
         image_extensions = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']
