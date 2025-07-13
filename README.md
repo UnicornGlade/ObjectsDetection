@@ -122,5 +122,5 @@ python src/create_tiles_dataset.py --input_dir data/dataset01 --output_dir data/
 # run training on data/dataset01_tiles640 with frozen backbone (i.e. fine-tune)
 python src/train_rtmdet.py
 
-python src/export_onnx.py --img data/dataset01/P1000101_1400494888594.JPG --ckpt models/ --out models/exported_model.onnx
+python src/export_onnx.py --img data/dataset01/P1000101_1400494888594.JPG --cfg src/configs/rtmdet_car.py --ckpt models/ --out models/exported_model.onnx
 ```
