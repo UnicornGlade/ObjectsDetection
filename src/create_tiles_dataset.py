@@ -23,7 +23,7 @@ class TileGenerator:
                  min_objects_per_tile: int = 0,
                  min_object_area_ratio: float = 0.3,
                  enable_augmentation: bool = True,
-                 augmentation_copies: int = 5,
+                 augmentation_copies: int = 1,
                  balance_negatives: bool = True,
                  negative_ratio: float = 1.0):
         """
