@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 # ---- your class list --------------------------------------------------------
 # YOLO id : name ; COCO ids must start at 1, so we add +1 later.
-YOLO_CLASSES = ['car', 'bus', 'truck']
+YOLO_CLASSES = ['car']
 
 # ------------------------------------------------------------------------------------------------------------------
 def yolo_txt_to_boxes(txt: Path, W: int, H: int) -> List[Dict]:

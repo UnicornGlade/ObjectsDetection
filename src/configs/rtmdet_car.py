@@ -1,7 +1,7 @@
 _base_ = '../../pretrained/rtmdet_tiny_8xb32-300e_coco.py'
 
-num_classes = 3
-class_names = ('car', 'bus', 'truck')
+num_classes = 1
+class_names = ('car')
 
 work_dir = 'models/rtmdet_car'
 
@@ -57,7 +57,7 @@ val_dataloader = dict(
         ann_file='instances_val.json',          # ← файл, который создал скрипт
         data_prefix=dict(img=''),               # картинки лежат прямо в корне
         test_mode=True,
-        metainfo=dict(classes=('car', 'bus', 'truck')),
+        metainfo=dict(classes=('car')),
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(type='LoadAnnotations', with_bbox=True),

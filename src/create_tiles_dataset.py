@@ -208,7 +208,7 @@ class TileGenerator:
         return {
             "id": ann_id,
             "image_id": image_id,
-            "category_id": category_id + 1,  # COCO categories start from 1
+            "category_id": int(category_id) + 1,  # COCO categories start from 1
             "bbox": bbox,
             "area": area,
             "iscrowd": 0
@@ -481,7 +481,7 @@ class TileGenerator:
         
         # Load class names
         classes_file = os.path.join(input_dir, "classes.txt")
-        class_names = ['car', 'bus', 'truck']  # Default classes
+        class_names = ['car']  # Default classes
         if os.path.exists(classes_file):
             with open(classes_file, 'r') as f:
                 class_names = [line.strip() for line in f if line.strip()]

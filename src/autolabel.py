@@ -12,8 +12,8 @@ from utils.box import coco2yolo, draw_boxes
 CFG_FILE = 'pretrained/rtmdet_tiny_8xb32-300e_coco.py'
 CKPT_FILE = 'pretrained/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth'
 
-CLASSES = ['car', 'bus', 'truck']
-COCO2YOLO = {2: 0, 5: 1, 7: 2}
+CLASSES = ['car']
+COCO2YOLO = {2: 0}
 
 def fetch_config(path_or_url: str) -> str:
      if path_or_url.startswith(('http://', 'https://')):
