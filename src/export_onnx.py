@@ -58,13 +58,104 @@ from mmdet.structures import DetDataSample
 
 import cv2, numpy as np, torch
 
-def post_nms(dets, iou_thr=0.5, top_k=300):
+IOU_THR = 0.3
+SCORE_THR = 0.5
+
+def post_nms(dets, iou_thr=IOU_THR, top_k=300):
     """dets: (N,6)  →  (M,6) after NMS, M≤top_k"""
     boxes = torch.as_tensor(dets[:, :4])
     scores= torch.as_tensor(dets[:, 4])
     keep  = tvops.nms(boxes, scores, iou_thr)
     keep  = keep[: top_k]
     return dets[keep.cpu().numpy()]
+
+# ----------------------------------------------------------------------
+# Tiled-inference helpers  (640×640 tiles, 50 % overlap)
+# ----------------------------------------------------------------------
+_TSIZE   = 640
+_OVERLAP = 0.5
+_STRIDE  = int(_TSIZE * (1.0 - _OVERLAP))
+
+
+def _pad_to_square(img: np.ndarray, size: int = _TSIZE) -> np.ndarray:
+    """Pad (без рескейла!) до size×size правым/нижним отступом цветом 114."""
+    h, w = img.shape[:2]
+    if h == size and w == size:
+        return img
+    canvas = np.full((size, size, 3), 114, np.uint8)
+    canvas[:h, :w] = img
+    return canvas
+
+
+def _batched_nms_np(dets: np.ndarray,
+                    iou_thr: float = IOU_THR,
+                    top_k: int = 300) -> np.ndarray:
+    """Class-aware NMS для массива (N,6)."""
+    if not len(dets):
+        return dets
+    boxes  = torch.as_tensor(dets[:, :4])
+    scores = torch.as_tensor(dets[:, 4])
+    labels = torch.as_tensor(dets[:, 5])
+    keep   = tvops.batched_nms(boxes, scores, labels, iou_thr)[: top_k]
+    return dets[keep.cpu().numpy()]
+
+
+def tiled_inference(img_bgr: np.ndarray,
+                    infer_tile_fn,
+                    iou_thr: float = IOU_THR,
+                    min_pixels_area_thr: float = None,
+                    top_k: int = 300) -> np.ndarray:
+    """
+    Разбивает `img_bgr` на тайлы 640×640 (захлест 50 %),
+    применяет `infer_tile_fn(tile_bgr)` → ndarray(N,6) в локальных координатах,
+    сдвигает боксы в глобальные, затем единый batched-NMS.
+    """
+    h, w = img_bgr.shape[:2]
+    dets_all = []
+
+    y0 = 0
+    while True:
+        if y0 + _TSIZE > h:
+            y0 = max(h - _TSIZE, 0)
+        x0 = 0
+        while True:
+            if x0 + _TSIZE > w:
+                x0 = max(w - _TSIZE, 0)
+
+            tile = img_bgr[y0:y0 + _TSIZE, x0:x0 + _TSIZE].copy()
+            assert tile.shape[:2] == (_TSIZE, _TSIZE)
+
+            # use this if input image is smaller than 640x640
+            # tile = _pad_to_square(tile, _TSIZE)
+
+            dets_tile = infer_tile_fn(tile)  # (n,6) либо []
+
+            if min_pixels_area_thr and len(dets_tile):
+                # filter too-small boxes
+                wh = (dets_tile[:, 2] - dets_tile[:, 0]) * (dets_tile[:, 3] - dets_tile[:, 1])
+                dets_tile = dets_tile[wh >= min_pixels_area_thr]
+
+            if len(dets_tile):
+                dets_tile = dets_tile.copy()
+                dets_tile[:, [0, 2]] += x0  # shift X
+                dets_tile[:, [1, 3]] += y0  # shift Y
+                dets_all.append(dets_tile)
+
+            if x0 + _TSIZE >= w:
+                break
+            x0 += _STRIDE
+        if y0 + _TSIZE >= h:
+            break
+        y0 += _STRIDE
+
+    if not dets_all:
+        return np.empty((0, 6), np.float32)
+    dets_all = np.vstack(dets_all)
+
+    if iou_thr:
+        dets_all = _batched_nms_np(dets_all, iou_thr, top_k)
+
+    return dets_all
 
 # ----------------------------------------------------------------------
 # Draw MMDetection result on an image (v2.x *или* v3.x).
@@ -86,19 +177,6 @@ def _unpack(result):
                 lbl = np.full((dets.shape[0], 1), cls, dtype=np.float32)
                 outs.append(np.hstack([dets, lbl]))
         return np.vstack(outs) if outs else np.empty((0, 6), np.float32)
-
-def draw_result(img_path, result, class_names, out_file, score_thr=0.3):
-    mat = cv2.imread(img_path)
-    dets = _unpack(result)
-    for x1, y1, x2, y2, score, label in dets:
-        if score < score_thr:
-            continue
-        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
-        cv2.rectangle(mat, p1, p2, (0, 255, 0), 2)
-        txt = f'{class_names[int(label)]} {score:.2f}'
-        cv2.putText(mat, txt, (p1[0], max(p1[1] - 2, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-    cv2.imwrite(out_file, mat)
 
 # -----------------------------------------------------------------------------
 # helpers
@@ -134,15 +212,9 @@ def preprocess(img_bgr: np.ndarray, dst_sz: int = 640) -> tuple[torch.Tensor, fl
     return tensor, scale
 
 
-def visualise(img_bgr: np.ndarray, dets: np.ndarray, names: list[str], out: str, thr: float = 0.4):
+def visualise(img_bgr: np.ndarray, dets: np.ndarray, names: list[str], out: str):
     """Draw boxes [x1,y1,x2,y2,score,label]."""
-    h, w = img_bgr.shape[:2]
-    dst_sz = 640
-    scale = min(dst_sz / w, dst_sz / h)
-    dets[:, :4] /= scale # TODO make division on copy of dets (to not modify arguments)
     for x1, y1, x2, y2, s, cls in dets:
-        if s < thr:
-            continue
         color = (0, 255, 0)
         cv2.rectangle(img_bgr, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
         cv2.putText(img_bgr, f"{names[int(cls)]}:{s:.2f}", (int(x1), int(y1) - 4),
@@ -274,52 +346,57 @@ def process_single_image(img_path, model, wrapper, sess, class_names, args):
     tensor, _ = preprocess(img_bgr)
     tensor_pt = tensor.cuda() / 255.0
 
+    # --- native MMDet (tiled) ----------------------------------------
+    def _infer_native(tile_bgr):
+        res = inference_detector(model, tile_bgr)
+        return _unpack(res)
+
+    native_mmdet_res = tiled_inference(img_bgr, _infer_native)
+
+    # --- PyTorch wrapper (tiled) -------------------------------------
     with torch.no_grad():
-        det_pt = wrapper(tensor_pt.unsqueeze(0))[0]
-        det_pt = post_nms(det_pt, 0.5)
+        def _infer_pt(tile_bgr):
+            t = torch.from_numpy(cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
+                                 ).permute(2, 0, 1).float().cuda() / 255.0
+            with torch.no_grad():
+                return wrapper(t.unsqueeze(0))[0].cpu().numpy()
 
+        pytorch_wrapper_res = tiled_inference(img_bgr, _infer_pt)
+
+    # --- ONNX (tiled) -------------------------------------------------
     input_name = sess.get_inputs()[0].name
-    det_onnx = sess.run(None, {input_name: tensor_pt.unsqueeze(0).cpu().numpy()})[0]
-    det_onnx = det_onnx[0]
-    det_onnx = post_nms(det_onnx, 0.5)
+    def _infer_onnx(tile_bgr):
+        t = torch.from_numpy(cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
+                             ).permute(2, 0, 1).float().unsqueeze(0).cpu().numpy() / 255.0
+        return sess.run(None, {input_name: t})[0][0]
 
-    h, w = img_bgr.shape[:2]
-    dst_sz = 640
-    scale = min(dst_sz / w, dst_sz / h)
-    det_pt[..., :4] /= scale
+    onnx_res = tiled_inference(img_bgr, _infer_onnx)
 
-    # Run PyTorch inference for comparison
-    res_pt = inference_detector(model, img_path)
-    
-    # Filter outputs
-    res_pt_filtered = filter_bboxes(_unpack(res_pt))
-    det_pt_filtered = filter_bboxes(det_pt.cpu())
-    det_onnx_filtered = filter_bboxes(det_onnx)
+    # Filter outputs (w.r.t. score threshold)
+    native_mmdet_res = filter_bboxes(native_mmdet_res, args.score_thr)
+    pytorch_wrapper_res = filter_bboxes(pytorch_wrapper_res, args.score_thr)
+    onnx_res = filter_bboxes(onnx_res, args.score_thr)
 
     # Generate output paths based on input image name
     img_name = Path(img_path).stem
     previews_dir = Path(args.out).parent / "previews"
     previews_dir.mkdir(parents=True, exist_ok=True)
     out_base = previews_dir / img_name
-    pt_out = str(out_base.with_name(f"{img_name}_pt.jpg"))
+
+    native_mmdet_out = str(out_base.with_name(f"{img_name}_native_mmdet.jpg"))
+    pytorch_wrapper_out = str(out_base.with_name(f"{img_name}_pytorch_wrapper.jpg"))
     onnx_out = str(out_base.with_name(f"{img_name}_onnx.jpg"))
 
     # Save visualizations
-    draw_result(img_path, res_pt, class_names=model.dataset_meta['classes'], out_file=pt_out)
-    visualise(img_bgr.copy(), det_onnx, class_names, onnx_out, args.score_thr)
+    visualise(img_bgr.copy(), native_mmdet_res, class_names, native_mmdet_out)
+    visualise(img_bgr.copy(), pytorch_wrapper_res, class_names, pytorch_wrapper_out)
+    visualise(img_bgr.copy(), onnx_res, class_names, onnx_out)
 
     # Print detection results
     print(f"\nResults for {img_path}:")
-    print(f"PyTorch inference results 1: {res_pt_filtered.shape[0]} bboxes")
-    print(f"PyTorch inference results 2: {det_pt_filtered.shape[0]} bboxes")
-    print(f"ONNX inference results: {det_onnx_filtered.shape[0]} bboxes")
-
-    # Check numeric difference
-    det_pt_cpu = det_pt.cpu()  # Move to CPU before numpy conversion
-    # avg_diff = np.average(np.abs(det_pt_cpu - det_onnx))
-    # print(f"Numeric diff: {avg_diff:.2e}")
-    
-    # return avg_diff
+    print(f"PyTorch inference results: {native_mmdet_res.shape[0]} bboxes")
+    print(f"Wrapper inference results: {pytorch_wrapper_res.shape[0]} bboxes")
+    print(f"ONNX inference results: {onnx_res.shape[0]} bboxes (should be the same or very close to 'Wrapper' results)")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -327,8 +404,7 @@ def main():
     ap.add_argument("--ckpt", default="../models", help=".pth or dir with checkpoints")
     ap.add_argument("--img", required=True, help="path to image file or directory")
     ap.add_argument("--out", default="../models/rtmdet_car.onnx")
-    ap.add_argument("--score_thr", type=float, default=0.3)
-    ap.add_argument("--diff_thr", type=float, default=0.5, help="max avg abs diff allowed")
+    ap.add_argument("--score_thr", type=float, default=SCORE_THR)
     args = ap.parse_args()
 
     # ------- load model & initialize --------------------------------
@@ -366,11 +442,8 @@ def main():
     # Process images
     img_path = Path(args.img)
     if img_path.is_file():
-        pass
         # Single image processing
-        #avg_diff = process_single_image(str(img_path), model, wrapper, sess, class_names, args)
-        # if avg_diff is not None and avg_diff > args.diff_thr:
-        #     raise RuntimeError(f"ONNX mismatch: max abs diff {avg_diff:.4e} > {args.diff_thr}")
+        process_single_image(str(img_path), model, wrapper, sess, class_names, args)
     elif img_path.is_dir():
         # Directory processing
         image_files = list(img_path.glob("*.jpg")) + list(img_path.glob("*.jpeg")) + list(img_path.glob("*.png"))
@@ -381,13 +454,7 @@ def main():
         max_diff = 0
         for img_file in image_files:
             print(f"\nProcessing {img_file}...")
-            avg_diff = process_single_image(str(img_file), model, wrapper, sess, class_names, args)
-            if avg_diff is not None:
-                max_diff = max(max_diff, avg_diff)
-        
-        if max_diff > args.diff_thr:
-            raise RuntimeError(f"ONNX mismatch: max abs diff {max_diff:.4e} > {args.diff_thr}")
-        print(f"\nAll images processed successfully. Maximum numeric diff: {max_diff:.2e}")
+            process_single_image(str(img_file), model, wrapper, sess, class_names, args)
     else:
         sys.exit(f"[ERROR] Path {args.img} does not exist or is neither a file nor directory")
 
