@@ -10,7 +10,7 @@ def _install_torch():
 def _install_mmcv():
     # see https://github.com/open-mmlab/mmcv?tab=readme-ov-file#install-mmcv
     # pip install -U openmim
-    # mim install mmcv==2.3.0
+    # mim install mmcv==2.1.0
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-U', 'openmim'])
     subprocess.check_call([sys.executable, '-m', 'mim', 'install', 'mmcv==2.1.0'])
 
@@ -25,9 +25,12 @@ def _download_pretrained():
     subprocess.check_call([sys.executable, '-m', 'mim', 'download', 'mmdet', '--config', 'rtmdet_tiny_8xb32-300e_coco', '--dest', 'pretrained'])
 
 _install_torch()
-_install_mmcv()
-_install_mmdet()
-_download_pretrained()
+
+if sys.version_info[:2] == (3, 11):
+    # mim doesn't work on Python 3.12+, but on Python 3.11 it works, so it can be used to auto-download pretrained weights
+    _install_mmcv()
+    _install_mmdet()
+    _download_pretrained()
 
 setup(
     name='objects-detection',
@@ -46,5 +49,8 @@ setup(
         'tqdm',
         'numpy<2',
         'requests',
+        'mmcv==2.1.0',
+        'mmengine>=0.10.3',
+        'mmdet>=3.2.0',
     ],
 )
