@@ -3,11 +3,16 @@ import sys, subprocess
 
 CUDA_TAG = 'cu121'  # change if you use another CUDA toolkit build
 
+def _install_torch():
+    # pip install torch==2.3.0+cu121 torchvision==0.18.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'torch==2.3.0+cu121', 'torchvision==0.18.0+cu121', '--extra-index-url', 'https://download.pytorch.org/whl/cu121'])
+
 def _install_mmcv():
     # see https://github.com/open-mmlab/mmcv?tab=readme-ov-file#install-mmcv
     # pip install -U openmim
     # mim install mmcv==2.1.0
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-U', 'openmim'])
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'setuptools']) # to fix Python 3.12 - see https://github.com/open-mmlab/mmcv/issues/3263#issuecomment-2747343383
     subprocess.check_call([sys.executable, '-m', 'mim', 'install', 'mmcv==2.1.0'])
 
 def _install_mmdet():
@@ -20,11 +25,10 @@ def _download_pretrained():
     # mim download mmdet --config rtmdet_tiny_8xb32-300e_coco --dest pretrained
     subprocess.check_call([sys.executable, '-m', 'mim', 'download', 'mmdet', '--config', 'rtmdet_tiny_8xb32-300e_coco', '--dest', 'pretrained'])
 
-if sys.version_info[:2] == (3, 11):
-    # mim doesn't work on Python 3.12+, but on Python 3.11 it works, so it can be used to auto-download pretrained weights
-    _install_mmcv()
-    _install_mmdet()
-    _download_pretrained()
+_install_torch()
+_install_mmcv()
+_install_mmdet()
+_download_pretrained()
 
 setup(
     name='objects-detection',
